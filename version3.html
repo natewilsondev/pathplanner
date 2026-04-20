@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FRC High-Fidelity Path Planner</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background: #222; color: white; }
+        canvas { border: 2px solid #555; background-color: #333; cursor: crosshair; margin-top: 20px; }
+        .controls { margin: 20px; text-align: center; }
+        #output { width: 700px; height: 150px; background: #000; color: #0f0; padding: 10px; font-family: monospace; overflow-y: auto; font-size: 12px; }
+        button { padding: 10px 20px; cursor: pointer; background: #444; color: white; border: none; border-radius: 4px; margin: 0 5px; }
+        button:hover { background: #666; }
+        .param-group { display: inline-block; margin: 5px 10px; text-align: left; vertical-align: top; }
+        input[type="number"] { width: 65px; background: #444; color: white; border: 1px solid #666; padding: 3px; border-radius: 4px; }
+        #stats { color: #0f0; font-family: monospace; margin: 10px; font-size: 16px; display: flex; gap: 20px; }
+        .hint { color: #aaa; font-size: 13px; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+    <h2>FRC Holonomic Physics Planner (2026)</h2>
+    <div class="controls">
+        <button onclick="clearPath()">Clear Path</button>
+        <button onclick="startSimulation()" id="runBtn">Run Path</button>
+        <button onclick="optimizeWeights()" style="background: #28a745;">Optimize Speed</button>
+        <button onclick="fixCollisions()" style="background: #dc3545;">Fix Collisions</button>
+        
+        <div style="margin-top: 15px; border-top: 1px solid #444; padding-top: 10px;">
+            <div class="param-group"><label>VMax (m/s)<br><input type="number" id="vMax" value="4.5" step="0.1" onchange="updateTrajectory()"></label></div>
+            <div class="param-group"><label>AMax (m/s²)<br><input type="number" id="aMax" value="3.5" step="0.1" onchange="updateTrajectory()"></label></div>
+            <div class="param-group"><label>Centripetal<br><input type="number" id="aCent" value="5.5" step="0.1" onchange="updateTrajectory()"></label></div>
+            <div class="param-group"><label>Rot Vel<br><input type="number" id="rotVelMax" value="6.28" step="0.5" onchange="updateTrajectory()"></label></div>
+        </div>
+
+        <div style="margin-top: 10px;">
+            <div class="param-group"><label>Width (in)<br><input type="number" id="botW" value="28" step="1" onchange="updateTrajectory()"></label></div>
+            <div class="param-group"><label>Length (in)<br><input type="number" id="botL" value="28" step="1" onchange="updateTrajectory()"></label></div>
+            <div class="param-group"><label>Mass (kg)<br><input type="number" id="botMass" value="50" step="1" onchange="updateDerivedParams()"></label></div>
+            <div class="param-group"><label>MOI (kg·m²)<br><input type="number" id="botJ" value="6.0" step="0.1" onchange="updateDerivedParams()"></label></div>
+            <div class="param-group"><label>Motors (#)<br><input type="number" id="numMotors" value="4" step="1" onchange="updateDerivedParams()"></label></div>
+            <div class="param-group"><label>Gear Ratio<br><input type="number" id="gearRatio" value="6.75" step="0.25" onchange="updateDerivedParams()"></label></div>
+            <div class="param-group"><label>Wheel Dia (in)<br><input type="number" id="wheelDia" value="4" step="0.5" onchange="updateDerivedParams()"></label></div>
+            <div class="param-group"><label>Motor % Cap<br><input type="number" id="motorCap" value="40" step="5" onchange="updateDerivedParams()"></label></div>
+        </div>
+        <p class="hint">Click to add point. Shift+Drag center for Turn Weight. Deselect by clicking empty space.</p>
+    </div>
+
+    <canvas id="fieldCanvas" width="1000" height="500"></canvas>
+
+    <div id="stats">
+        <span id="statTime">Est. Time: 0.00s</span>
+        <span id="statV">Velocity: 0.00 m/s</span>
+        <span id="statOmega">Angular: 0.00 rad/s</span>
+    </div>
+    
+    <div id="output">[]</div>
+
+    <script>
+        const canvas = document.getElementById('fieldCanvas');
+        const ctx = canvas.getContext('2d');
+        const output = document.getElementById('output');
+        const statTime = document.getElementById('statTime');
+        const statV = document.getElementById('statV');
+        const statOmega = document.getElementById('statOmega');
+        // Kraken X60 constants — swap these for your motor
+        const MOTOR_STALL_TORQUE = 9.37;  // N·m
+        const MOTOR_FREE_SPEED = 6000;    // RPM
+        
+        let waypoints = []; 
+        let trajectory = []; 
+        let violations = []; 
+        let cachedViolations = [];
+        const history = [];
+        let isAnimating = false;
+        let robot = { x: 0, y: 0, heading: 0, s: 0, v: 0 };
+        let animationId = null;
+
+        let draggedPoint = null, rotatingHeading = null, weightDragging = false, selectedPoint = null;
+
+        const FIELD_WIDTH_M = 16.54, FIELD_HEIGHT_M = 8.27, IN_TO_M = 0.0254;
+
+        function updateTrajectory() {
+            try { generateTrajectory(); updateOutput(); } 
+            catch (e) { console.error("Trajectory Error:", e); trajectory = []; }
+            draw();
+        }
+        //vMax from free speed will be slightly optimistic (~5-10%) because back-EMF and friction eat into it at top speed. 
+        //The efficiency factor partially covers this but you could add a separate vMax cap like * 0.9 if your robot consistently falls short. 
+        //The rotVelMax derivation assumes the robot spins from rest through 180° — this is a reasonable practical cap but you can tune motorCap down if real-world rotation is slower. 
+        //The fields remain editable, so a driver/programmer can still manually override the computed values for a specific match. 
+        //The computation just gives you a physically grounded starting point instead of a guess.
+
+        function updateDerivedParams() {
+            const numMotors  = parseFloat(document.getElementById('numMotors').value)  || 4;
+            const gearRatio  = parseFloat(document.getElementById('gearRatio').value)  || 6.75;
+            const wheelDia   = parseFloat(document.getElementById('wheelDia').value)   || 4;
+            const motorCap   = parseFloat(document.getElementById('motorCap').value)   || 40;
+            const mass       = parseFloat(document.getElementById('botMass').value)    || 50;
+            const J          = parseFloat(document.getElementById('botJ').value)       || 6.0;
+            const botW       = parseFloat(document.getElementById('botW').value) * IN_TO_M;
+
+            const wheelRadius = (wheelDia * IN_TO_M) / 2;
+            const efficiency  = 0.85; // ~15% drivetrain loss, typical for swerve
+            const capFraction = motorCap / 100;
+
+            // Total force the drivetrain can push with at the carpet
+            const F_max = numMotors * MOTOR_STALL_TORQUE * gearRatio * efficiency * capFraction / wheelRadius;
+
+            // Linear acceleration
+            const aMax = F_max / mass;
+
+            // Max free speed of the wheel surface = motor free speed converted through gearing
+            const vMax = (MOTOR_FREE_SPEED / 60) * (2 * Math.PI) * wheelRadius / gearRatio;
+
+            // Rotational: torque couple from left/right sides, divided by MOI
+            // For swerve, each side has numMotors/2 motors contributing to rotation
+            const F_rot = (numMotors / 2) * MOTOR_STALL_TORQUE * gearRatio * efficiency * capFraction / wheelRadius;
+            const alphaMax = (F_rot * botW / 2) / J;
+            // Integrate to get a useful rotVelMax — cap at what's physically reachable
+            const rotVelMax = Math.sqrt(2 * alphaMax * Math.PI); // ~180deg worth of spin-up
+
+            // Write back into the fields so the user can still see/override them
+            document.getElementById('vMax').value  = vMax.toFixed(2);
+            document.getElementById('aMax').value  = aMax.toFixed(2);
+            document.getElementById('rotVelMax').value = rotVelMax.toFixed(2);
+
+            updateTrajectory();
+        }
+
+        canvas.addEventListener('mousedown', function(e) {
+            if (isAnimating) return;
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left, mouseY = e.clientY - rect.top;
+            let clickedIdx = -1, subElement = null;
+            for (let i = 0; i < waypoints.length; i++) {
+                const p = waypoints[i];
+                const hx = p.x + Math.cos(p.heading) * 40, hy = p.y + Math.sin(p.heading) * 40;
+                if (Math.hypot(mouseX - hx, mouseY - hy) < 18) { clickedIdx = i; subElement = 'heading'; break; }
+                if (Math.hypot(mouseX - p.x, mouseY - p.y) < 18) { saveHistory(); clickedIdx = i; subElement = 'center'; break; }
+            }
+            if (clickedIdx !== -1) {
+                selectedPoint = clickedIdx;
+                if (subElement === 'heading') rotatingHeading = clickedIdx;
+                else { draggedPoint = clickedIdx; weightDragging = e.shiftKey; }
+            } else {
+                if (selectedPoint !== null) { selectedPoint = null; }
+                else {
+                    const fX = (mouseX / canvas.width * FIELD_WIDTH_M).toFixed(2);
+                    const fY = ((canvas.height - mouseY) / canvas.height * FIELD_HEIGHT_M).toFixed(2);
+                    saveHistory();
+                    const newP = {x: mouseX, y: mouseY, heading: 0, fieldX: fX, fieldY: fY, weight: 0.4};
+                    waypoints.push(newP); selectedPoint = waypoints.length - 1;
+                    updateTrajectory();
+                }
+            }
+            draw();
+        });
+
+        window.addEventListener('mousedown', (e) => { if (e.target !== canvas && !e.target.closest('.controls')) { selectedPoint = null; draw(); } });
+        
+        canvas.addEventListener('mousemove', function(e) {
+            if (draggedPoint === null && rotatingHeading === null) return;
+            const rect = canvas.getBoundingClientRect();
+            const mX = e.clientX - rect.left, mY = e.clientY - rect.top;
+            if (draggedPoint !== null) {
+                const p = waypoints[draggedPoint];
+                if (weightDragging) p.weight = Math.max(0.1, Math.min(3.0, p.weight + (p.y - mY) / 500));
+                else {
+                    p.x = Math.max(0, Math.min(canvas.width, mX)); p.y = Math.max(0, Math.min(canvas.height, mY));
+                    p.fieldX = (p.x / canvas.width * FIELD_WIDTH_M).toFixed(2); p.fieldY = ((canvas.height - p.y) / canvas.height * FIELD_HEIGHT_M).toFixed(2);
+                }
+            } else if (rotatingHeading !== null) { waypoints[rotatingHeading].heading = Math.atan2(mY - waypoints[rotatingHeading].y, mX - waypoints[rotatingHeading].x); }
+            updateTrajectory();
+        });
+
+        window.addEventListener('mouseup', () => { draggedPoint = null; rotatingHeading = null; weightDragging = false; });
+        window.addEventListener('keydown', (e) => {
+            if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey)) {
+                if (history.length === 0) return;
+                waypoints = history.pop();
+                selectedPoint = null;
+                updateTrajectory();
+                return;
+            }
+            if ((e.key === 'Backspace' || e.key === 'Delete') && selectedPoint !== null) {
+                saveHistory();  // save before delete
+                waypoints.splice(selectedPoint, 1);
+                selectedPoint = null;
+                updateTrajectory();
+            }
+        });
+        function generateTrajectory() {
+            trajectory = [];
+            if (waypoints.length < 2) { statTime.innerText = "Est. Time: 0.00s"; return; }
+            const vMax = parseFloat(document.getElementById('vMax').value) || 1, aMaxIn = parseFloat(document.getElementById('aMax').value) || 1;
+            const aCent = parseFloat(document.getElementById('aCent').value) || 1, rotMax = parseFloat(document.getElementById('rotVelMax').value) || 1;
+            const M_TO_PX = canvas.width / FIELD_WIDTH_M;
+
+            let pts = [];
+            for (let i = 0; i < waypoints.length - 1; i++) {
+                const p0 = waypoints[i], p1 = waypoints[i+1], dist = Math.max(1, Math.hypot(p1.x - p0.x, p1.y - p0.y));
+                let v0x = (p1.x-p0.x)*p0.weight, v0y = (p1.y-p0.y)*p0.weight, v1x = (p1.x-p0.x)*p1.weight, v1y = (p1.y-p0.y)*p1.weight;
+                if (i > 0) { const a = Math.atan2(p1.y-waypoints[i-1].y, p1.x-waypoints[i-1].x); v0x = Math.cos(a)*dist*p0.weight; v0y = Math.sin(a)*dist*p0.weight; }
+                if (i < waypoints.length-2) { const a = Math.atan2(waypoints[i+2].y-p0.y, waypoints[i+2].x-p0.x); v1x = Math.cos(a)*dist*p1.weight; v1y = Math.sin(a)*dist*p1.weight; }
+                for (let t = 0; t < 1; t += 0.01) {
+                    const h0=2*t**3-3*t**2+1, h1=-2*t**3+3*t**2, h2=t**3-2*t**2+t, h3=t**3-t**2;
+                    const dH = (() => { let d = p1.heading - p0.heading; if (d > Math.PI) d -= 2*Math.PI; if (d < -Math.PI) d += 2*Math.PI; return d; })();
+                    pts.push({ 
+                        x: h0*p0.x+h1*p1.x+h2*v0x+h3*v1x, 
+                        y: h0*p0.y+h1*p1.y+h2*v0y+h3*v1y, 
+                        heading: p0.heading + dH*t, 
+                        segmentIdx: i });
+                }
+            }
+            pts.push({...waypoints[waypoints.length-1]});
+
+            let totalDist = 0;
+            for (let i = 0; i < pts.length; i++) {
+                let ds = (i > 0) ? Math.hypot(pts[i].x-pts[i-1].x, pts[i].y-pts[i-1].y)/M_TO_PX : 0;
+                totalDist += ds;
+                let vLimit = vMax;
+                const win = 8;
+                if (i > win && i < pts.length - win) {
+                    const pP = pts[i-win], pC = pts[i], pN = pts[i+win];
+                    if (pP && pC && pN) {
+                        const a1 = Math.atan2(pC.y-pP.y, pC.x-pP.x), a2 = Math.atan2(pN.y-pC.y, pN.x-pC.x);
+                        let da = Math.abs(a2-a1); if(da > Math.PI) da = 2*Math.PI-da;
+                        const dSum = Math.max(0.01, (Math.hypot(pC.x-pP.x, pC.y-pP.y) + Math.hypot(pN.x-pC.x, pN.y-pC.y))/M_TO_PX);
+                        vLimit = Math.min(vMax,( Math.sqrt(aCent / (da / dSum || 0.001)) || Number.POSITIVE_INFINITY));
+                    }
+                }
+                trajectory.push({...pts[i], segmentIdx: pts[i].segmentIdx, s: totalDist, v: vLimit, actualV: 0, omega: 0, fieldX: (pts[i].x/canvas.width*FIELD_WIDTH_M).toFixed(2), fieldY: ((canvas.height-pts[i].y)/canvas.height*FIELD_HEIGHT_M).toFixed(2)});
+            }
+
+            trajectory[0].actualV = 0.1;
+            for (let i = 1; i < trajectory.length; i++) {
+                const ds = Math.max(0.001, trajectory[i].s - trajectory[i-1].s);
+                const power = Math.max(0.15, 1.0 - (trajectory[i-1].actualV / vMax));
+                trajectory[i].actualV = Math.min(trajectory[i].v, Math.sqrt(trajectory[i-1].actualV**2 + 2 * (aMaxIn * power) * ds));
+            }
+            trajectory[trajectory.length-1].actualV = 0.05;
+            for (let i = trajectory.length-2; i >= 0; i--) {
+                const ds = Math.max(0.001, trajectory[i+1].s - trajectory[i].s);
+                trajectory[i].actualV = Math.min(trajectory[i].actualV, Math.sqrt(trajectory[i+1].actualV**2 + 2 * aMaxIn * ds));
+            }
+
+            for (let i = 1; i < trajectory.length; i++) {
+                const ds = Math.max(0.001, trajectory[i].s - trajectory[i-1].s);
+                let dH = trajectory[i].heading - trajectory[i-1].heading;
+                if (dH > Math.PI) dH -= 2*Math.PI;
+                if (dH < -Math.PI) dH += 2*Math.PI;
+                
+                if (Math.abs(dH) > 0.001) {
+                    const dtNeeded = Math.abs(dH) / rotMax;
+                    const vImplied = ds / dtNeeded;
+                    trajectory[i].actualV = Math.min(trajectory[i].actualV, vImplied);
+                }
+            }
+
+
+            let totalT = 0;
+            for (let i = 1; i < trajectory.length; i++) {
+                const ds = trajectory[i].s - trajectory[i-1].s, dt = Math.max(0.001, ds / (trajectory[i].actualV || 0.1));
+                totalT += dt; trajectory[i].t = totalT;
+                let dH = trajectory[i].heading - trajectory[i-1].heading;
+                if (dH > Math.PI) dH -= 2*Math.PI; if (dH < -Math.PI) dH += 2*Math.PI;
+                const rotMax = parseFloat(document.getElementById('rotVelMax').value) || 6.28;
+                const rawOmega = dH / dt;
+
+                if (Math.abs(rawOmega) > rotMax) {
+                    // rotation is the limiting factor - scale dt to what rotation actually needs,
+                    // then back-calculate what translation velocity that implies
+                    const dtNeeded = Math.abs(dH) / rotMax;
+                    const ds = trajectory[i].s - trajectory[i - 1].s;
+                    trajectory[i].actualV = Math.min(trajectory[i].actualV, ds / dtNeeded);
+                    trajectory[i].omega = dH / dtNeeded;
+                } else {
+                    trajectory[i].omega = rawOmega;
+                }
+            }
+            statTime.innerText = `Est. Time: ${totalT.toFixed(2)}s`;
+            cachedViolations = computeViolations();
+            return totalT;
+        }
+
+        function computeViolations() {
+            if (trajectory.length === 0) return [];
+            const localV = [];
+            const M_PX = canvas.width / FIELD_WIDTH_M, bW = parseFloat(document.getElementById('botW').value)*IN_TO_M*M_PX, bL = parseFloat(document.getElementById('botL').value)*IN_TO_M*M_PX;
+            const hO = (143.5*IN_TO_M)*M_PX, hS = (47*IN_TO_M)*M_PX, hT = canvas.height/2-hS/2, hB = canvas.height/2+hS/2, bH = 49.85*IN_TO_M*M_PX;
+            const obs = [{x:canvas.width/2-hO-hS/2, y:hT, w:hS, h:hS}, {x:canvas.width/2+hO-hS/2, y:hT, w:hS, h:hS}, {x:canvas.width/2-hO-hS/2, y:hT-bH, w:hS, h:bH}, {x:canvas.width/2-hO-hS/2, y:hB, w:hS, h:bH}, {x:canvas.width/2+hO-hS/2, y:hT-bH, w:hS, h:bH}, {x:canvas.width/2+hO-hS/2, y:hB, w:hS, h:bH}];
+            
+            trajectory.forEach((p, idx) => {
+                const cosH = Math.cos(p.heading), sinH = Math.sin(p.heading);
+                const corners = [{x:p.x+(bL/2)*cosH-(bW/2)*sinH, y:p.y+(bL/2)*sinH+(bW/2)*cosH}, {x:p.x+(bL/2)*cosH+(bW/2)*sinH, y:p.y+(bL/2)*sinH-(bW/2)*cosH}, {x:p.x-(bL/2)*cosH+(bW/2)*sinH, y:p.y-(bL/2)*sinH-(bW/2)*cosH}, {x:p.x-(bL/2)*cosH-(bW/2)*sinH, y:p.y-(bL/2)*sinH+(bW/2)*cosH}];
+                for (const c of corners) {
+                    if (c.x < 0 || c.x > canvas.width || c.y < 0 || c.y > canvas.height) { localV.push(idx); break; }
+                    for (const o of obs) if (c.x > o.x && c.x < o.x+o.w && c.y > o.y && c.y < o.y+o.h) { localV.push(idx); break; }
+                }
+            });
+            return localV;
+        }
+
+        function fixCollisions() {
+            if (waypoints.length < 2 || computeViolations().length === 0) return;
+            for (let iter = 0; iter < 100 && computeViolations().length > 0; iter++) {
+                const vIdx = computeViolations()[0];
+                
+                const segIdx = trajectory[vIdx]?.segmentIdx ?? 0;
+                const wpIdx = Math.min(segIdx, waypoints.length - 2); // clamp to valid range
+                
+                const p0 = waypoints[wpIdx], p1 = waypoints[wpIdx + 1];
+                const curV = computeViolations().length;
+                const prev0 = p0.weight, prev1 = p1.weight;
+                p0.weight = Math.min(3.0, p0.weight + 0.1);
+                p1.weight = Math.min(3.0, p1.weight + 0.1);
+                generateTrajectory();
+                if (computeViolations().length >= curV) {
+                    p0.weight = Math.max(0.1, prev0 - 0.1);
+                    p1.weight = Math.max(0.1, prev1 - 0.1);
+                    generateTrajectory();
+                }
+            }
+            updateTrajectory();
+        }
+
+        function optimizeWeights() {
+            if (waypoints.length < 2) return;
+            for (let g = 0; g < 3; g++) {
+                let improved = false;
+                waypoints.forEach((p, idx) => {
+                    if (idx === 0 || idx === waypoints.length-1) return;
+                    let bestW = p.weight, minT = (computeViolations().length > 0 ? 999 : parseFloat(statTime.innerText.split(' ')[2]));
+                    [0.1, -0.1, 0.02, -0.02].forEach(d => {
+                        const prev = p.weight; 
+                        p.weight = Math.max(0.1, Math.min(3.0, bestW+d));
+                        const newT = generateTrajectory();  // uses return value now
+                        const newViolations = computeViolations();
+                        const score = newViolations.length > 0 ? 999 : newT;
+                        if (score < minT - 0.001) {
+                            minT = score; bestW = p.weight; improved = true;
+                        } else {
+                            p.weight = prev;
+                        }
+                    });
+                });
+                if (!improved) break;
+            }
+            updateTrajectory();
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const M_PX = canvas.width/FIELD_WIDTH_M, hO = (143.5*IN_TO_M)*M_PX, hS = (47*IN_TO_M)*M_PX, hT = canvas.height/2-hS/2, hB = canvas.height/2+hS/2, bH = 49.85*IN_TO_M*M_PX;
+            ctx.strokeStyle = "#444"; ctx.lineWidth = 1;
+            for(let i=0; i<=canvas.width; i+=canvas.width/FIELD_WIDTH_M) { ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,canvas.height); ctx.stroke(); }
+            for(let i=0; i<=canvas.height; i+=canvas.height/FIELD_HEIGHT_M) { ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(canvas.width,i); ctx.stroke(); }
+            ctx.fillStyle = "rgba(0,0,255,0.7)"; ctx.fillRect(canvas.width/2-hO-hS/2, hT, hS, hS);
+            ctx.fillStyle = "rgba(255,0,0,0.7)"; ctx.fillRect(canvas.width/2+hO-hS/2, hT, hS, hS);
+            ctx.fillStyle = "#555"; 
+            ctx.fillRect(canvas.width/2-hO-hS/2, hT-bH, hS, bH); ctx.fillRect(canvas.width/2-hO-hS/2, hB, hS, bH);
+            ctx.fillRect(canvas.width/2+hO-hS/2, hT-bH, hS, bH); ctx.fillRect(canvas.width/2+hO-hS/2, hB, hS, bH);
+            waypoints.forEach((p, i) => {
+                const sel = selectedPoint === i; ctx.fillStyle = sel ? "#00FF00" : "#FFCC00"; ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, Math.PI*2); ctx.fill();
+                const hx = p.x + Math.cos(p.heading)*40, hy = p.y + Math.sin(p.heading)*40;
+                ctx.strokeStyle = "#FFCC00"; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(hx, hy); ctx.stroke();
+                ctx.save(); ctx.translate(hx, hy); ctx.rotate(p.heading); ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(-10,-5); ctx.lineTo(-10,5); ctx.closePath(); ctx.fill(); ctx.restore();
+                if (sel) { ctx.strokeStyle = "rgba(0,170,255,0.5)"; ctx.beginPath(); ctx.arc(p.x,p.y,p.weight*100,0,Math.PI*2); ctx.stroke(); ctx.strokeStyle = "white"; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(p.x,p.y,12,0,Math.PI*2); ctx.stroke(); }
+            });
+            const detailedV = cachedViolations;
+            if (waypoints.length >= 2 && trajectory.length > 0) {
+                ctx.strokeStyle = (detailedV.length > 0) ? "red" : "#00AAFF"; ctx.lineWidth = 3;
+                ctx.beginPath(); ctx.moveTo(trajectory[0].x, trajectory[0].y);
+                for (let i = 1; i < trajectory.length; i++) ctx.lineTo(trajectory[i].x, trajectory[i].y);
+                ctx.stroke();
+                ctx.fillStyle = "red"; detailedV.forEach((v, idx) => { if (idx % 5 === 0) { ctx.beginPath(); ctx.arc(trajectory[v].x, trajectory[v].y, 3, 0, Math.PI*2); ctx.fill(); } });
+            }
+            if (isAnimating) {
+                const M_PX = canvas.width/FIELD_WIDTH_M, bW = parseFloat(document.getElementById('botW').value)*IN_TO_M*M_PX, bL = parseFloat(document.getElementById('botL').value)*IN_TO_M*M_PX;
+                ctx.save(); ctx.translate(robot.x, robot.y); ctx.rotate(robot.heading); ctx.fillStyle = "rgba(255,255,255,0.8)"; ctx.fillRect(-bL/2,-bW/2,bL,bW); ctx.fillStyle = "red"; ctx.fillRect(bL/2-5,-bW/2,5,bW); ctx.restore();
+            }
+        }
+        function startSimulation() { if (trajectory.length < 2 || isAnimating) return; isAnimating = true; robot.s = 0; animate(); }
+        function animate() {
+            if (!isAnimating) return;
+            const dt = 1/60; let idx = 0; while (idx < trajectory.length - 1 && trajectory[idx+1].s < robot.s) idx++;
+            const p0 = trajectory[idx], p1 = trajectory[idx+1] || p0;
+            let t = (p1.s > p0.s) ? (robot.s - p0.s) / (p1.s - p0.s) : 0;
+            robot.x = p0.x + (p1.x - p0.x)*t; robot.y = p0.y + (p1.y - p0.y)*t;
+            let h0 = p0.heading, h1 = p1.heading; if(h1-h0 > Math.PI) h1-=2*Math.PI; if(h1-h0 < -Math.PI) h1+=2*Math.PI;
+            robot.heading = h0 + (h1-h0)*t;
+            const curV = p0.actualV + (p1.actualV - p0.actualV)*t, curO = p0.omega + (p1.omega - p0.omega)*t;
+            statV.innerText = `Velocity: ${curV.toFixed(2)} m/s`; statOmega.innerText = `Angular: ${curO.toFixed(2)} rad/s`;
+            robot.s += Math.max(0.1, curV) * dt; 
+            if (robot.s >= trajectory[trajectory.length-1].s) { isAnimating = false; draw(); return; }
+            draw(); animationId = requestAnimationFrame(animate);
+        }
+        
+        function updateOutput() {
+            if (trajectory.length === 0) { output.innerText = '[]'; return; }
+            
+            const TIME_STEP = 0.02; // 20ms = standard FRC loop period
+            const maxT = trajectory[trajectory.length - 1].t || 0;
+            const payload = [];
+            
+            for (let t = 0; t <= maxT + TIME_STEP; t += TIME_STEP) {
+                // Binary search for the surrounding trajectory points
+                let lo = 0, hi = trajectory.length - 1;
+                while (lo < hi - 1) {
+                    const mid = (lo + hi) >> 1;
+                    if ((trajectory[mid].t || 0) < t) lo = mid; else hi = mid;
+                }
+                const p0 = trajectory[lo], p1 = trajectory[hi];
+                const span = (p1.t || 0) - (p0.t || 0);
+                const alpha = span > 0 ? Math.min(1, (t - (p0.t || 0)) / span) : 0;
+                
+                // Interpolate heading shortest-path
+                let dH = p1.heading - p0.heading;
+                if (dH > Math.PI) dH -= 2 * Math.PI;
+                if (dH < -Math.PI) dH += 2 * Math.PI;
+                
+                payload.push({
+                    t: t.toFixed(3),
+                    x: ((p0.x + (p1.x - p0.x) * alpha) / canvas.width * FIELD_WIDTH_M).toFixed(3),
+                    y: (((canvas.height - (p0.y + (p1.y - p0.y) * alpha)) / canvas.height) * FIELD_HEIGHT_M).toFixed(3),
+                    h: ((p0.heading + dH * alpha) * 180 / Math.PI).toFixed(2),
+                    v: (p0.actualV + (p1.actualV - p0.actualV) * alpha).toFixed(3),
+                    omega: (p0.omega + (p1.omega - p0.omega) * alpha).toFixed(3),
+                });
+            }
+            output.innerText = JSON.stringify(payload, null, 2);
+        }
+        function clearPath() { 
+            saveHistory();
+            isAnimating = false; 
+            cancelAnimationFrame(animationId); 
+            waypoints = []; 
+            trajectory = []; 
+            selectedPoint = null; 
+            draw(); 
+            updateOutput(); }
+        updateDerivedParams();
+        draw();
+        function saveHistory() {
+            history.push(JSON.parse(JSON.stringify(waypoints)));
+            if (history.length > 50) history.shift();
+        }
+    </script>
+</body>
+</html>
+
+
