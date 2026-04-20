@@ -11,18 +11,47 @@
         button:hover { background: #666; }
         .param-group { display: inline-block; margin: 5px 10px; text-align: left; vertical-align: top; }
         input[type="number"] { width: 65px; background: #444; color: white; border: 1px solid #666; padding: 3px; border-radius: 4px; }
+        input[type="text"] { background: #444; color: white; border: 1px solid #666; padding: 6px 10px; border-radius: 4px; font-size: 14px; width: 180px; }
         #stats { color: #0f0; font-family: monospace; margin: 10px; font-size: 16px; display: flex; gap: 20px; }
         .hint { color: #aaa; font-size: 13px; margin-top: 5px; }
+
+        /* Project bar */
+        #projectBar {
+            display: flex; align-items: center; gap: 10px;
+            background: #2a2a2a; border: 1px solid #444; border-radius: 6px;
+            padding: 10px 16px; margin: 10px 0; width: 700px; box-sizing: border-box;
+        }
+        #projectStatus { font-size: 13px; color: #aaa; flex: 1; }
+        #projectStatus.linked { color: #4caf50; }
+        .btn-link { background: #1565c0 !important; }
+        .btn-link:hover { background: #1976d2 !important; }
+        .btn-save { background: #2e7d32 !important; }
+        .btn-save:hover { background: #388e3c !important; }
+        .btn-save:disabled { background: #555 !important; cursor: not-allowed; opacity: 0.5; }
+        #saveMsg { font-size: 12px; margin-top: 6px; height: 16px; }
+        #saveMsg.ok { color: #4caf50; }
+        #saveMsg.err { color: #ef5350; }
     </style>
 </head>
 <body>
 
     <h2>FRC Holonomic Physics Planner (2026)</h2>
+
+    <!-- Project linking bar -->
+    <div id="projectBar">
+        <span id="projectStatus">No project linked</span>
+        <button class="btn-link" onclick="linkProject()">🔗 Link Project</button>
+        <input type="text" id="pathName" placeholder="Path name (e.g. Blue Auto)" value="MyPath" />
+        <button class="btn-save" id="saveBtn" onclick="saveToProject()" disabled>💾 Save to Project</button>
+    </div>
+    <div id="saveMsg"></div>
+
     <div class="controls">
         <button onclick="clearPath()">Clear Path</button>
         <button onclick="startSimulation()" id="runBtn">Run Path</button>
         <button onclick="optimizeWeights()" style="background: #28a745;">Optimize Speed</button>
         <button onclick="fixCollisions()" style="background: #dc3545;">Fix Collisions</button>
+        <button onclick="downloadJSON()" style="background: #6a1b9a;">⬇ Download JSON</button>
         
         <div style="margin-top: 15px; border-top: 1px solid #444; padding-top: 10px;">
             <div class="param-group"><label>VMax (m/s)<br><input type="number" id="vMax" value="4.5" step="0.1" onchange="updateTrajectory()"></label></div>
@@ -61,9 +90,11 @@
         const statTime = document.getElementById('statTime');
         const statV = document.getElementById('statV');
         const statOmega = document.getElementById('statOmega');
-        // Kraken X60 constants — swap these for your motor
-        const MOTOR_STALL_TORQUE = 9.37;  // N·m
-        const MOTOR_FREE_SPEED = 6000;    // RPM
+        const saveMsg = document.getElementById('saveMsg');
+        const saveBtn = document.getElementById('saveBtn');
+
+        const MOTOR_STALL_TORQUE = 9.37;
+        const MOTOR_FREE_SPEED = 6000;
         
         let waypoints = []; 
         let trajectory = []; 
@@ -73,21 +104,110 @@
         let isAnimating = false;
         let robot = { x: 0, y: 0, heading: 0, s: 0, v: 0 };
         let animationId = null;
-
         let draggedPoint = null, rotatingHeading = null, weightDragging = false, selectedPoint = null;
 
+        // Project linking state
+        let projectDirHandle = null;
+
         const FIELD_WIDTH_M = 16.54, FIELD_HEIGHT_M = 8.27, IN_TO_M = 0.0254;
+
+        // ── Project / file system ─────────────────────────────────────────────
+
+        async function linkProject() {
+            if (!('showDirectoryPicker' in window)) {
+                showSaveMsg('Your browser does not support the File System API. Use Chrome or Edge.', true);
+                return;
+            }
+            try {
+                projectDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                document.getElementById('projectStatus').textContent = '✅ Linked: ' + projectDirHandle.name;
+                document.getElementById('projectStatus').classList.add('linked');
+                saveBtn.disabled = false;
+                showSaveMsg('Project linked! Hit "Save to Project" any time.', false);
+            } catch (e) {
+                if (e.name !== 'AbortError') showSaveMsg('Could not link project: ' + e.message, true);
+            }
+        }
+
+        async function getOrCreateDir(parent, name) {
+            return parent.getDirectoryHandle(name, { create: true });
+        }
+
+        async function saveToProject() {
+            if (!projectDirHandle) { showSaveMsg('Link a project first.', true); return; }
+            const name = (document.getElementById('pathName').value.trim() || 'MyPath').replace(/[^a-zA-Z0-9_\- ]/g, '');
+            if (trajectory.length === 0) { showSaveMsg('Generate a path first.', true); return; }
+
+            try {
+                // Traverse/create: src/main/deploy/pathplanner/paths/
+                let dir = projectDirHandle;
+                for (const seg of ['src', 'main', 'deploy', 'pathplanner', 'paths']) {
+                    dir = await getOrCreateDir(dir, seg);
+                }
+
+                const fileHandle = await dir.getFileHandle(`${name}.json`, { create: true });
+                const writable = await fileHandle.createWritable();
+                await writable.write(buildPayloadJSON());
+                await writable.close();
+                showSaveMsg(`✅ Saved → pathplanner/paths/${name}.json`, false);
+            } catch (e) {
+                showSaveMsg('Save failed: ' + e.message, true);
+            }
+        }
+
+        function downloadJSON() {
+            if (trajectory.length === 0) { showSaveMsg('Generate a path first.', true); return; }
+            const name = (document.getElementById('pathName').value.trim() || 'MyPath');
+            const blob = new Blob([buildPayloadJSON()], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = name + '.json';
+            a.click();
+            URL.revokeObjectURL(a.href);
+        }
+
+        function showSaveMsg(msg, isError) {
+            saveMsg.textContent = msg;
+            saveMsg.className = isError ? 'err' : 'ok';
+            if (!isError) setTimeout(() => { saveMsg.textContent = ''; saveMsg.className = ''; }, 4000);
+        }
+
+        function buildPayloadJSON() {
+            const TIME_STEP = 0.02;
+            const maxT = trajectory[trajectory.length - 1].t || 0;
+            const payload = [];
+            for (let t = 0; t <= maxT + TIME_STEP; t += TIME_STEP) {
+                let lo = 0, hi = trajectory.length - 1;
+                while (lo < hi - 1) {
+                    const mid = (lo + hi) >> 1;
+                    if ((trajectory[mid].t || 0) < t) lo = mid; else hi = mid;
+                }
+                const p0 = trajectory[lo], p1 = trajectory[hi];
+                const span = (p1.t || 0) - (p0.t || 0);
+                const alpha = span > 0 ? Math.min(1, (t - (p0.t || 0)) / span) : 0;
+                let dH = p1.heading - p0.heading;
+                if (dH > Math.PI) dH -= 2 * Math.PI;
+                if (dH < -Math.PI) dH += 2 * Math.PI;
+                payload.push({
+                    t: parseFloat(t.toFixed(3)),
+                    x: parseFloat(((p0.x + (p1.x - p0.x) * alpha) / canvas.width * FIELD_WIDTH_M).toFixed(3)),
+                    y: parseFloat((((canvas.height - (p0.y + (p1.y - p0.y) * alpha)) / canvas.height) * FIELD_HEIGHT_M).toFixed(3)),
+                    // heading in radians (WPILib standard)
+                    h: parseFloat((p0.heading + dH * alpha).toFixed(4)),
+                    v: parseFloat((p0.actualV + (p1.actualV - p0.actualV) * alpha).toFixed(3)),
+                    omega: parseFloat((p0.omega + (p1.omega - p0.omega) * alpha).toFixed(3)),
+                });
+            }
+            return JSON.stringify(payload, null, 2);
+        }
+
+        // ── Trajectory / physics ──────────────────────────────────────────────
 
         function updateTrajectory() {
             try { generateTrajectory(); updateOutput(); } 
             catch (e) { console.error("Trajectory Error:", e); trajectory = []; }
             draw();
         }
-        //vMax from free speed will be slightly optimistic (~5-10%) because back-EMF and friction eat into it at top speed. 
-        //The efficiency factor partially covers this but you could add a separate vMax cap like * 0.9 if your robot consistently falls short. 
-        //The rotVelMax derivation assumes the robot spins from rest through 180° — this is a reasonable practical cap but you can tune motorCap down if real-world rotation is slower. 
-        //The fields remain editable, so a driver/programmer can still manually override the computed values for a specific match. 
-        //The computation just gives you a physically grounded starting point instead of a guess.
 
         function updateDerivedParams() {
             const numMotors  = parseFloat(document.getElementById('numMotors').value)  || 4;
@@ -97,32 +217,18 @@
             const mass       = parseFloat(document.getElementById('botMass').value)    || 50;
             const J          = parseFloat(document.getElementById('botJ').value)       || 6.0;
             const botW       = parseFloat(document.getElementById('botW').value) * IN_TO_M;
-
             const wheelRadius = (wheelDia * IN_TO_M) / 2;
-            const efficiency  = 0.85; // ~15% drivetrain loss, typical for swerve
+            const efficiency  = 0.85;
             const capFraction = motorCap / 100;
-
-            // Total force the drivetrain can push with at the carpet
             const F_max = numMotors * MOTOR_STALL_TORQUE * gearRatio * efficiency * capFraction / wheelRadius;
-
-            // Linear acceleration
             const aMax = F_max / mass;
-
-            // Max free speed of the wheel surface = motor free speed converted through gearing
             const vMax = (MOTOR_FREE_SPEED / 60) * (2 * Math.PI) * wheelRadius / gearRatio;
-
-            // Rotational: torque couple from left/right sides, divided by MOI
-            // For swerve, each side has numMotors/2 motors contributing to rotation
             const F_rot = (numMotors / 2) * MOTOR_STALL_TORQUE * gearRatio * efficiency * capFraction / wheelRadius;
             const alphaMax = (F_rot * botW / 2) / J;
-            // Integrate to get a useful rotVelMax — cap at what's physically reachable
-            const rotVelMax = Math.sqrt(2 * alphaMax * Math.PI); // ~180deg worth of spin-up
-
-            // Write back into the fields so the user can still see/override them
+            const rotVelMax = Math.sqrt(2 * alphaMax * Math.PI);
             document.getElementById('vMax').value  = vMax.toFixed(2);
             document.getElementById('aMax').value  = aMax.toFixed(2);
             document.getElementById('rotVelMax').value = rotVelMax.toFixed(2);
-
             updateTrajectory();
         }
 
@@ -147,15 +253,15 @@
                     const fX = (mouseX / canvas.width * FIELD_WIDTH_M).toFixed(2);
                     const fY = ((canvas.height - mouseY) / canvas.height * FIELD_HEIGHT_M).toFixed(2);
                     saveHistory();
-                    const newP = {x: mouseX, y: mouseY, heading: 0, fieldX: fX, fieldY: fY, weight: 0.4};
-                    waypoints.push(newP); selectedPoint = waypoints.length - 1;
+                    waypoints.push({x: mouseX, y: mouseY, heading: 0, fieldX: fX, fieldY: fY, weight: 0.4});
+                    selectedPoint = waypoints.length - 1;
                     updateTrajectory();
                 }
             }
             draw();
         });
 
-        window.addEventListener('mousedown', (e) => { if (e.target !== canvas && !e.target.closest('.controls')) { selectedPoint = null; draw(); } });
+        window.addEventListener('mousedown', (e) => { if (e.target !== canvas && !e.target.closest('.controls') && !e.target.closest('#projectBar')) { selectedPoint = null; draw(); } });
         
         canvas.addEventListener('mousemove', function(e) {
             if (draggedPoint === null && rotatingHeading === null) return;
@@ -176,18 +282,13 @@
         window.addEventListener('keydown', (e) => {
             if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey)) {
                 if (history.length === 0) return;
-                waypoints = history.pop();
-                selectedPoint = null;
-                updateTrajectory();
-                return;
+                waypoints = history.pop(); selectedPoint = null; updateTrajectory(); return;
             }
             if ((e.key === 'Backspace' || e.key === 'Delete') && selectedPoint !== null) {
-                saveHistory();  // save before delete
-                waypoints.splice(selectedPoint, 1);
-                selectedPoint = null;
-                updateTrajectory();
+                saveHistory(); waypoints.splice(selectedPoint, 1); selectedPoint = null; updateTrajectory();
             }
         });
+
         function generateTrajectory() {
             trajectory = [];
             if (waypoints.length < 2) { statTime.innerText = "Est. Time: 0.00s"; return; }
@@ -204,11 +305,7 @@
                 for (let t = 0; t < 1; t += 0.01) {
                     const h0=2*t**3-3*t**2+1, h1=-2*t**3+3*t**2, h2=t**3-2*t**2+t, h3=t**3-t**2;
                     const dH = (() => { let d = p1.heading - p0.heading; if (d > Math.PI) d -= 2*Math.PI; if (d < -Math.PI) d += 2*Math.PI; return d; })();
-                    pts.push({ 
-                        x: h0*p0.x+h1*p1.x+h2*v0x+h3*v1x, 
-                        y: h0*p0.y+h1*p1.y+h2*v0y+h3*v1y, 
-                        heading: p0.heading + dH*t, 
-                        segmentIdx: i });
+                    pts.push({ x: h0*p0.x+h1*p1.x+h2*v0x+h3*v1x, y: h0*p0.y+h1*p1.y+h2*v0y+h3*v1y, heading: p0.heading + dH*t, segmentIdx: i });
                 }
             }
             pts.push({...waypoints[waypoints.length-1]});
@@ -225,7 +322,7 @@
                         const a1 = Math.atan2(pC.y-pP.y, pC.x-pP.x), a2 = Math.atan2(pN.y-pC.y, pN.x-pC.x);
                         let da = Math.abs(a2-a1); if(da > Math.PI) da = 2*Math.PI-da;
                         const dSum = Math.max(0.01, (Math.hypot(pC.x-pP.x, pC.y-pP.y) + Math.hypot(pN.x-pC.x, pN.y-pC.y))/M_TO_PX);
-                        vLimit = Math.min(vMax,( Math.sqrt(aCent / (da / dSum || 0.001)) || Number.POSITIVE_INFINITY));
+                        vLimit = Math.min(vMax, Math.sqrt(aCent / (da / dSum || 0.001)) || Number.POSITIVE_INFINITY);
                     }
                 }
                 trajectory.push({...pts[i], segmentIdx: pts[i].segmentIdx, s: totalDist, v: vLimit, actualV: 0, omega: 0, fieldX: (pts[i].x/canvas.width*FIELD_WIDTH_M).toFixed(2), fieldY: ((canvas.height-pts[i].y)/canvas.height*FIELD_HEIGHT_M).toFixed(2)});
@@ -242,13 +339,11 @@
                 const ds = Math.max(0.001, trajectory[i+1].s - trajectory[i].s);
                 trajectory[i].actualV = Math.min(trajectory[i].actualV, Math.sqrt(trajectory[i+1].actualV**2 + 2 * aMaxIn * ds));
             }
-
             for (let i = 1; i < trajectory.length; i++) {
                 const ds = Math.max(0.001, trajectory[i].s - trajectory[i-1].s);
                 let dH = trajectory[i].heading - trajectory[i-1].heading;
                 if (dH > Math.PI) dH -= 2*Math.PI;
                 if (dH < -Math.PI) dH += 2*Math.PI;
-                
                 if (Math.abs(dH) > 0.001) {
                     const dtNeeded = Math.abs(dH) / rotMax;
                     const vImplied = ds / dtNeeded;
@@ -256,22 +351,19 @@
                 }
             }
 
-
             let totalT = 0;
+            trajectory[0].t = 0;
             for (let i = 1; i < trajectory.length; i++) {
                 const ds = trajectory[i].s - trajectory[i-1].s, dt = Math.max(0.001, ds / (trajectory[i].actualV || 0.1));
                 totalT += dt; trajectory[i].t = totalT;
                 let dH = trajectory[i].heading - trajectory[i-1].heading;
                 if (dH > Math.PI) dH -= 2*Math.PI; if (dH < -Math.PI) dH += 2*Math.PI;
-                const rotMax = parseFloat(document.getElementById('rotVelMax').value) || 6.28;
+                const rMax = parseFloat(document.getElementById('rotVelMax').value) || 6.28;
                 const rawOmega = dH / dt;
-
-                if (Math.abs(rawOmega) > rotMax) {
-                    // rotation is the limiting factor - scale dt to what rotation actually needs,
-                    // then back-calculate what translation velocity that implies
-                    const dtNeeded = Math.abs(dH) / rotMax;
-                    const ds = trajectory[i].s - trajectory[i - 1].s;
-                    trajectory[i].actualV = Math.min(trajectory[i].actualV, ds / dtNeeded);
+                if (Math.abs(rawOmega) > rMax) {
+                    const dtNeeded = Math.abs(dH) / rMax;
+                    const dseg = trajectory[i].s - trajectory[i-1].s;
+                    trajectory[i].actualV = Math.min(trajectory[i].actualV, dseg / dtNeeded);
                     trajectory[i].omega = dH / dtNeeded;
                 } else {
                     trajectory[i].omega = rawOmega;
@@ -288,7 +380,6 @@
             const M_PX = canvas.width / FIELD_WIDTH_M, bW = parseFloat(document.getElementById('botW').value)*IN_TO_M*M_PX, bL = parseFloat(document.getElementById('botL').value)*IN_TO_M*M_PX;
             const hO = (143.5*IN_TO_M)*M_PX, hS = (47*IN_TO_M)*M_PX, hT = canvas.height/2-hS/2, hB = canvas.height/2+hS/2, bH = 49.85*IN_TO_M*M_PX;
             const obs = [{x:canvas.width/2-hO-hS/2, y:hT, w:hS, h:hS}, {x:canvas.width/2+hO-hS/2, y:hT, w:hS, h:hS}, {x:canvas.width/2-hO-hS/2, y:hT-bH, w:hS, h:bH}, {x:canvas.width/2-hO-hS/2, y:hB, w:hS, h:bH}, {x:canvas.width/2+hO-hS/2, y:hT-bH, w:hS, h:bH}, {x:canvas.width/2+hO-hS/2, y:hB, w:hS, h:bH}];
-            
             trajectory.forEach((p, idx) => {
                 const cosH = Math.cos(p.heading), sinH = Math.sin(p.heading);
                 const corners = [{x:p.x+(bL/2)*cosH-(bW/2)*sinH, y:p.y+(bL/2)*sinH+(bW/2)*cosH}, {x:p.x+(bL/2)*cosH+(bW/2)*sinH, y:p.y+(bL/2)*sinH-(bW/2)*cosH}, {x:p.x-(bL/2)*cosH+(bW/2)*sinH, y:p.y-(bL/2)*sinH-(bW/2)*cosH}, {x:p.x-(bL/2)*cosH-(bW/2)*sinH, y:p.y-(bL/2)*sinH+(bW/2)*cosH}];
@@ -304,19 +395,15 @@
             if (waypoints.length < 2 || computeViolations().length === 0) return;
             for (let iter = 0; iter < 100 && computeViolations().length > 0; iter++) {
                 const vIdx = computeViolations()[0];
-                
                 const segIdx = trajectory[vIdx]?.segmentIdx ?? 0;
-                const wpIdx = Math.min(segIdx, waypoints.length - 2); // clamp to valid range
-                
+                const wpIdx = Math.min(segIdx, waypoints.length - 2);
                 const p0 = waypoints[wpIdx], p1 = waypoints[wpIdx + 1];
                 const curV = computeViolations().length;
                 const prev0 = p0.weight, prev1 = p1.weight;
-                p0.weight = Math.min(3.0, p0.weight + 0.1);
-                p1.weight = Math.min(3.0, p1.weight + 0.1);
+                p0.weight = Math.min(3.0, p0.weight + 0.1); p1.weight = Math.min(3.0, p1.weight + 0.1);
                 generateTrajectory();
                 if (computeViolations().length >= curV) {
-                    p0.weight = Math.max(0.1, prev0 - 0.1);
-                    p1.weight = Math.max(0.1, prev1 - 0.1);
+                    p0.weight = Math.max(0.1, prev0 - 0.1); p1.weight = Math.max(0.1, prev1 - 0.1);
                     generateTrajectory();
                 }
             }
@@ -333,14 +420,11 @@
                     [0.1, -0.1, 0.02, -0.02].forEach(d => {
                         const prev = p.weight; 
                         p.weight = Math.max(0.1, Math.min(3.0, bestW+d));
-                        const newT = generateTrajectory();  // uses return value now
+                        const newT = generateTrajectory();
                         const newViolations = computeViolations();
                         const score = newViolations.length > 0 ? 999 : newT;
-                        if (score < minT - 0.001) {
-                            minT = score; bestW = p.weight; improved = true;
-                        } else {
-                            p.weight = prev;
-                        }
+                        if (score < minT - 0.001) { minT = score; bestW = p.weight; improved = true; }
+                        else { p.weight = prev; }
                     });
                 });
                 if (!improved) break;
@@ -375,10 +459,11 @@
                 ctx.fillStyle = "red"; detailedV.forEach((v, idx) => { if (idx % 5 === 0) { ctx.beginPath(); ctx.arc(trajectory[v].x, trajectory[v].y, 3, 0, Math.PI*2); ctx.fill(); } });
             }
             if (isAnimating) {
-                const M_PX = canvas.width/FIELD_WIDTH_M, bW = parseFloat(document.getElementById('botW').value)*IN_TO_M*M_PX, bL = parseFloat(document.getElementById('botL').value)*IN_TO_M*M_PX;
+                const bW = parseFloat(document.getElementById('botW').value)*IN_TO_M*M_PX, bL = parseFloat(document.getElementById('botL').value)*IN_TO_M*M_PX;
                 ctx.save(); ctx.translate(robot.x, robot.y); ctx.rotate(robot.heading); ctx.fillStyle = "rgba(255,255,255,0.8)"; ctx.fillRect(-bL/2,-bW/2,bL,bW); ctx.fillStyle = "red"; ctx.fillRect(bL/2-5,-bW/2,5,bW); ctx.restore();
             }
         }
+
         function startSimulation() { if (trajectory.length < 2 || isAnimating) return; isAnimating = true; robot.s = 0; animate(); }
         function animate() {
             if (!isAnimating) return;
@@ -397,55 +482,21 @@
         
         function updateOutput() {
             if (trajectory.length === 0) { output.innerText = '[]'; return; }
-            
-            const TIME_STEP = 0.02; // 20ms = standard FRC loop period
-            const maxT = trajectory[trajectory.length - 1].t || 0;
-            const payload = [];
-            
-            for (let t = 0; t <= maxT + TIME_STEP; t += TIME_STEP) {
-                // Binary search for the surrounding trajectory points
-                let lo = 0, hi = trajectory.length - 1;
-                while (lo < hi - 1) {
-                    const mid = (lo + hi) >> 1;
-                    if ((trajectory[mid].t || 0) < t) lo = mid; else hi = mid;
-                }
-                const p0 = trajectory[lo], p1 = trajectory[hi];
-                const span = (p1.t || 0) - (p0.t || 0);
-                const alpha = span > 0 ? Math.min(1, (t - (p0.t || 0)) / span) : 0;
-                
-                // Interpolate heading shortest-path
-                let dH = p1.heading - p0.heading;
-                if (dH > Math.PI) dH -= 2 * Math.PI;
-                if (dH < -Math.PI) dH += 2 * Math.PI;
-                
-                payload.push({
-                    t: t.toFixed(3),
-                    x: ((p0.x + (p1.x - p0.x) * alpha) / canvas.width * FIELD_WIDTH_M).toFixed(3),
-                    y: (((canvas.height - (p0.y + (p1.y - p0.y) * alpha)) / canvas.height) * FIELD_HEIGHT_M).toFixed(3),
-                    h: ((p0.heading + dH * alpha) * 180 / Math.PI).toFixed(2),
-                    v: (p0.actualV + (p1.actualV - p0.actualV) * alpha).toFixed(3),
-                    omega: (p0.omega + (p1.omega - p0.omega) * alpha).toFixed(3),
-                });
-            }
-            output.innerText = JSON.stringify(payload, null, 2);
+            output.innerText = buildPayloadJSON();
         }
+
         function clearPath() { 
-            saveHistory();
-            isAnimating = false; 
-            cancelAnimationFrame(animationId); 
-            waypoints = []; 
-            trajectory = []; 
-            selectedPoint = null; 
-            draw(); 
-            updateOutput(); }
-        updateDerivedParams();
-        draw();
+            saveHistory(); isAnimating = false; cancelAnimationFrame(animationId); 
+            waypoints = []; trajectory = []; selectedPoint = null; draw(); updateOutput();
+        }
+
         function saveHistory() {
             history.push(JSON.parse(JSON.stringify(waypoints)));
             if (history.length > 50) history.shift();
         }
+
+        updateDerivedParams();
+        draw();
     </script>
 </body>
 </html>
-
-
